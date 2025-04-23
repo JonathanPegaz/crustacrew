@@ -1,6 +1,6 @@
 import { useKeyboardControls } from "@react-three/drei";
 import { useFrame } from "@react-three/fiber";
-import { CapsuleCollider, RigidBody } from "@react-three/rapier";
+import { CapsuleCollider, RigidBody, useRapier } from "@react-three/rapier";
 import { useControls } from "leva";
 import { useEffect, useRef, useState } from "react";
 import { MathUtils, Vector3 } from "three";
@@ -30,9 +30,8 @@ const lerpAngle = (start, end, t) => {
 };
 
 export const CharacterController = () => {
-  const { WALK_SPEED, RUN_SPEED, ROTATION_SPEED } = useControls(
-    "Character Control",
-    {
+  const { WALK_SPEED, RUN_SPEED, ROTATION_SPEED, PICKUP_DISTANCE } =
+    useControls("Character Control", {
       WALK_SPEED: { value: 0.8, min: 0.1, max: 4, step: 0.1 },
       RUN_SPEED: { value: 1.6, min: 0.2, max: 12, step: 0.1 },
       ROTATION_SPEED: {
@@ -41,13 +40,18 @@ export const CharacterController = () => {
         max: degToRad(5),
         step: degToRad(0.1),
       },
-    }
-  );
+      PICKUP_DISTANCE: { value: 1.5, min: 0.5, max: 5, step: 0.1 },
+    });
+
   const rb = useRef();
   const container = useRef();
   const character = useRef();
+  const { rapier, world } = useRapier();
 
   const [animation, setAnimation] = useState("idle");
+  const [heldObject, setHeldObject] = useState(null);
+  const [nearbyObjectId, setNearbyObjectId] = useState(null);
+  const [pickupCooldown, setPickupCooldown] = useState(false);
 
   const characterRotationTarget = useRef(0);
   const rotationTarget = useRef(0);
@@ -58,6 +62,9 @@ export const CharacterController = () => {
   const cameraLookAt = useRef(new Vector3());
   const [, get] = useKeyboardControls();
   const isClicking = useRef(false);
+
+  // Position de l'objet tenu relative au crabe (devant et légèrement au-dessus)
+  const heldObjectOffset = new Vector3(0, 0.5, 0.6);
 
   useEffect(() => {
     const onMouseDown = (e) => {
@@ -78,6 +85,95 @@ export const CharacterController = () => {
       document.removeEventListener("touchend", onMouseUp);
     };
   }, []);
+
+  // Fonction pour détecter les objets à proximité
+  const checkForPickableObjects = () => {
+    if (!rb.current) return;
+
+    const origin = rb.current.translation();
+    const direction = { x: 0, y: 0, z: 0 };
+
+    // On recherche les objets dans toutes les directions autour du crabe
+    for (let angle = 0; angle < Math.PI * 2; angle += Math.PI / 4) {
+      direction.x = Math.cos(angle);
+      direction.z = Math.sin(angle);
+
+      const ray = new rapier.Ray(origin, direction);
+      const hit = world.castRay(
+        ray,
+        PICKUP_DISTANCE,
+        true,
+        null,
+        null,
+        null,
+        rb.current
+      );
+
+      if (hit && hit.collider) {
+        const hitObject = hit.collider.parent();
+        const userData = hitObject?.userData;
+
+        if (userData && userData.type === "pickable") {
+          if (nearbyObjectId !== userData.id) {
+            setNearbyObjectId(userData.id);
+            // Émettre un événement pour informer l'interface utilisateur
+            window.dispatchEvent(
+              new CustomEvent("game-state-update", {
+                detail: { type: "NEARBY_OBJECT", id: userData.id },
+              })
+            );
+          }
+          return;
+        }
+      }
+    }
+
+    if (nearbyObjectId) {
+      setNearbyObjectId(null);
+      // Informer l'UI qu'il n'y a plus d'objet à proximité
+      window.dispatchEvent(
+        new CustomEvent("game-state-update", {
+          detail: { type: "NEARBY_OBJECT", id: null },
+        })
+      );
+    }
+  };
+
+  // Fonction pour ramasser ou déposer un objet
+  const handlePickupDrop = () => {
+    if (pickupCooldown) return;
+
+    // Si on tient déjà un objet, on le dépose
+    if (heldObject) {
+      setHeldObject(null);
+      setPickupCooldown(true);
+
+      // Émettre un événement pour informer l'interface utilisateur
+      window.dispatchEvent(
+        new CustomEvent("game-state-update", {
+          detail: { type: "HELD_OBJECT", id: null },
+        })
+      );
+
+      setTimeout(() => setPickupCooldown(false), 500); // Cooldown pour éviter les actions multiples
+      return;
+    }
+
+    // Sinon, on essaie de ramasser un objet à proximité
+    if (nearbyObjectId) {
+      setHeldObject(nearbyObjectId);
+      setPickupCooldown(true);
+
+      // Émettre un événement pour informer l'interface utilisateur
+      window.dispatchEvent(
+        new CustomEvent("game-state-update", {
+          detail: { type: "HELD_OBJECT", id: nearbyObjectId },
+        })
+      );
+
+      setTimeout(() => setPickupCooldown(false), 500);
+    }
+  };
 
   useFrame(({ camera, mouse }) => {
     if (rb.current) {
@@ -114,6 +210,11 @@ export const CharacterController = () => {
         movement.x = -1;
       }
 
+      // Gestion de la touche E pour ramasser/déposer
+      if (get().pickup && !pickupCooldown) {
+        handlePickupDrop();
+      }
+
       if (movement.x !== 0) {
         rotationTarget.current += ROTATION_SPEED * movement.x;
       }
@@ -127,15 +228,12 @@ export const CharacterController = () => {
           Math.cos(rotationTarget.current + characterRotationTarget.current) *
           speed;
         if (speed === RUN_SPEED) {
-          // setAnimation("run");
-          setAnimation("WalkSide");
+          setAnimation(heldObject ? "WalkFace" : "WalkSide");
         } else {
-          // setAnimation("walk");
-          setAnimation("WalkFace");
+          setAnimation(heldObject ? "WalkFace" : "WalkFace");
         }
       } else {
-        // setAnimation("idle");
-        setAnimation("Hiddle");
+        setAnimation(heldObject ? "Hiddle" : "Hiddle");
       }
       character.current.rotation.y = lerpAngle(
         character.current.rotation.y,
@@ -144,6 +242,12 @@ export const CharacterController = () => {
       );
 
       rb.current.setLinvel(vel, true);
+
+      // Vérifier les objets à proximité tous les quelques frames
+      if (Math.random() < 0.1) {
+        // 10% de chance à chaque frame = environ 6 fois par seconde
+        checkForPickableObjects();
+      }
     }
 
     // CAMERA
@@ -165,16 +269,33 @@ export const CharacterController = () => {
   });
 
   return (
-    <RigidBody colliders={false} lockRotations ref={rb}>
-      <group ref={container}>
-        <group ref={cameraTarget} position-z={1.5} />
-        <group ref={cameraPosition} position-y={4} position-z={-4} />
-        <group ref={character}>
-          {/* <Character scale={0.18} position-y={-0.25} animation={animation} /> */}
-          <Crab_2 scale={0.18} position-y={-0.25} animation={animation} />
+    <>
+      <RigidBody colliders={false} lockRotations ref={rb}>
+        <group ref={container}>
+          <group ref={cameraTarget} position-z={1.5} />
+          <group ref={cameraPosition} position-y={4} position-z={-4} />
+          <group ref={character}>
+            {/* <Character scale={0.18} position-y={-0.25} animation={animation} /> */}
+            <Crab_2 scale={0.18} position-y={-0.25} animation={animation} />
+          </group>
         </group>
-      </group>
-      <CapsuleCollider args={[0.08, 0.15]} />
-    </RigidBody>
+        <CapsuleCollider args={[0.08, 0.15]} />
+      </RigidBody>
+
+      {/* Retourne l'ID de l'objet tenu et sa position pour que Experience.jsx puisse le positionner */}
+      {heldObject && (
+        <group
+          name="heldObjectAnchor"
+          userData={{
+            heldObjectId: heldObject,
+            position: container.current
+              ? new Vector3()
+                  .copy(container.current.position)
+                  .add(heldObjectOffset)
+              : null,
+          }}
+        />
+      )}
+    </>
   );
 };
