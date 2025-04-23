@@ -99,7 +99,7 @@ export const Experience = () => {
     },
   });
   const { debugPhysics } = useControls("Physics", {
-    debugPhysics: false,
+    debugPhysics: true,
   });
 
   // Ajustements pour l'éclairage avec l'île
